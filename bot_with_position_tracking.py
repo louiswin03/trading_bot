@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import time
 import schedule
 import json
+import signal
 from datetime import datetime
 import pandas as pd
 
@@ -533,10 +534,23 @@ Time: {signal_time.strftime('%Y-%m-%d %H:%M')}
             msg = f"⚠️ BOT ERROR\n\n{str(e)}"
             send_telegram_message(msg)
 
+    def shutdown(self, signum=None, frame=None):
+        """Handle shutdown gracefully"""
+        print("\n\n[SHUTDOWN] Bot stopped")
+
+        status = "with OPEN position" if self.tracker.has_position() else "no position"
+        msg = f"🛑 BOT STOPPED\n\nBot stopped {status}"
+        send_telegram_message(msg)
+        sys.exit(0)
+
     def run(self):
         """Main execution loop"""
         print(f"[READY] Bot running with position tracking...")
         print("[INFO] Press Ctrl+C to stop\n")
+
+        # Handle SIGTERM (from systemd) and SIGINT (Ctrl+C)
+        signal.signal(signal.SIGTERM, self.shutdown)
+        signal.signal(signal.SIGINT, self.shutdown)
 
         # Schedule checks
         schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(self.check_signals)
@@ -545,16 +559,9 @@ Time: {signal_time.strftime('%Y-%m-%d %H:%M')}
         self.check_signals()
 
         # Loop
-        try:
-            while True:
-                schedule.run_pending()
-                time.sleep(10)
-        except KeyboardInterrupt:
-            print("\n\n[SHUTDOWN] Bot stopped")
-
-            status = "with OPEN position" if self.tracker.has_position() else "no position"
-            msg = f"🛑 BOT STOPPED\n\nBot stopped {status}"
-            send_telegram_message(msg)
+        while True:
+            schedule.run_pending()
+            time.sleep(10)
 
 
 def main():
