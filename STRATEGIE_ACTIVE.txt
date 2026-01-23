@@ -1,0 +1,130 @@
+================================================================================
+                        STRATEGIE ACTIVE DU BOT
+================================================================================
+
+STRATEGIE UTILISEE : ADX TREND (RANK 8)
+Fichier : final_strategy_rank8.py
+Bot actif : bot_with_position_tracking.py
+
+================================================================================
+PERFORMANCES BACKTESTEES (2017-2025, 8 ans) - AVEC TRAILING SL
+================================================================================
+
+Total Return      : 2065.57%
+Annual Return     : 45.04%
+Final Capital     : $216,557 (depuis $10,000)
+Max Drawdown      : 7.79%
+Total Trades      : 593
+Win Rate          : 50.9%
+Profit Factor     : 2.43
+Avg Win           : $1,495
+Avg Loss          : $-637
+
+Periode : 2017-08-17 a 2025-11-24 (8.23 ans)
+Paire : BTCUSDT
+Timeframe : 4h
+Frais Binance : 0.1% (inclus dans les resultats)
+
+================================================================================
+PARAMETRES DE LA STRATEGIE
+================================================================================
+
+ADX Threshold     : 30
+TP (Take Profit)  : 4.0%
+SL (Stop Loss)    : 0.7%
+Max Hold          : 20 bougies (80 heures en 4h)
+Volume Threshold  : 1.8x (volume > 1.8 * moyenne sur 20 periodes)
+
+Indicateurs utilises :
+- ADX (Average Directional Index)
+- DI+ et DI- (Directional Indicators)
+- EMA 20 et EMA 50 (Exponential Moving Averages)
+- Volume Ratio
+
+================================================================================
+CONDITIONS D'ENTREE
+================================================================================
+
+LONG (BUY) :
+- ADX > 30
+- DI+ > DI-
+- Prix > EMA20
+- EMA20 > EMA50
+- Volume ratio > 1.8x
+
+SHORT (SELL) :
+- ADX > 30
+- DI- > DI+
+- Prix < EMA20
+- EMA20 < EMA50
+- Volume ratio > 1.8x
+
+================================================================================
+CONDITIONS DE SORTIE
+================================================================================
+
+1. Take Profit atteint (+4.0% pour long, -4.0% pour short)
+2. Stop Loss touche (-0.7% pour long, +0.7% pour short)
+3. Signal Exit (ADX < 20 OU prix croise EMA20)
+4. Max Hold atteint (20 bougies = 80h)
+
+================================================================================
+LANCEMENT DU BOT
+================================================================================
+
+Commande : start_bot.bat
+OU : python bot_with_position_tracking.py
+
+Le bot utilise automatiquement la strategie ADX Rank 8.
+
+================================================================================
+NOTES IMPORTANTES
+================================================================================
+
+1. Cette strategie a ete testee sur 8 ans de donnees historiques
+2. Les resultats incluent les frais Binance (0.1% par trade)
+3. Performance constante : 45% annuel avec trailing SL dynamique
+4. Drawdown maximal : 7.79% (excellent)
+5. FEAR & GREED INDEX : NON UTILISE (degraderait les performances)
+6. VOLUME : Utilise volume TOTAL (pas filtre par couleur bougie - teste et valide)
+7. TRAILING SL : Ameliore les perfs de +725% vs SL fixe
+
+================================================================================
+FICHIERS DU PROJET
+================================================================================
+
+ESSENTIELS :
+- bot_with_position_tracking.py    : Bot actif qui trade la strategie
+- final_strategy_rank8.py          : Definition de la strategie optimale
+- telegram_bot.py                  : Notifications Telegram
+- verify_setup.py                  : Verification de la configuration
+
+RAPPORTS :
+- final_strategy_rank8_backtest.html : Rapport HTML complet des performances
+
+CONFIGURATION :
+- start_bot.bat                    : Script de lancement du bot
+- requirements.txt                 : Dependances Python
+- config/settings.py               : Configuration generale
+
+DOCUMENTATION :
+- STRATEGIE_ACTIVE.txt             : Ce fichier
+- POUR_LOUIS.txt                   : Notes personnelles
+- RESUME_FINAL.txt                 : Resume du projet
+- STRATEGIE_OPTIMISEE.txt          : Details de l'optimisation
+
+================================================================================
+DERNIER NETTOYAGE : 2025-11-10
+================================================================================
+
+Fichiers supprimes lors du nettoyage :
+- 22 fichiers Fear & Greed (strategie abandonnee)
+- 11 scripts d'optimisation (optimisation terminee)
+- 10 strategies intermediaires (gardee seulement Rank 8)
+- 4 anciennes versions du bot
+- 3 scripts de test
+- Divers fichiers obsoletes
+
+Le projet est maintenant PROPRE et OPTIMISE !
+
+================================================================================

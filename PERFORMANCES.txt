@@ -1,0 +1,118 @@
+================================================================================
+                    PERFORMANCES DE LA STRATEGIE
+================================================================================
+
+STRATEGIE : ADX TREND RANK 8 v2 + Trailing SL Dynamique
+PAIRE     : BTCUSDT
+TIMEFRAME : 4 heures
+PERIODE   : 17 Aout 2017 au 24 Novembre 2025 (8.23 ans)
+DONNEES   : 18,114 bougies
+
+================================================================================
+                         RESULTATS FINANCIERS
+================================================================================
+
+Capital Initial             $10,000
+Capital Final               $216,557
+                            ---------
+Rendement Total             +2,065.57%
+Rendement Annuel            +45.04%
+Drawdown Maximum            7.79%
+
+================================================================================
+                      STATISTIQUES DE TRADING
+================================================================================
+
+Total Trades                593
+Trades Gagnants             302 (50.9%)
+Trades Perdants             291 (49.1%)
+
+Gain Moyen                  $1,495.16
+Perte Moyenne               $-637.46
+Profit Factor               2.43
+
+================================================================================
+                            PARAMETRES
+================================================================================
+
+ADX Threshold               30 (tendance forte)
+Take Profit                 +4.0%
+Stop Loss Initial           -0.7%
+Max Hold                    20 bougies (80 heures)
+Volume Threshold            1.8x moyenne
+
+Trailing SL:
+  +0.5% gain -> SL a Breakeven (0%)
+  +1.0% gain -> SL a +0.5%
+  +1.5% gain -> SL a +1.0%
+  +2.0% gain -> SL a +1.5%
+
+================================================================================
+                          CONDITIONS ENTREE
+================================================================================
+
+LONG (Achat):
+  - ADX > 30
+  - DI+ > DI-
+  - Prix > EMA20
+  - EMA20 > EMA50
+  - Volume > 1.8x moyenne
+
+SHORT (Vente):
+  - ADX > 30
+  - DI- > DI+
+  - Prix < EMA20
+  - EMA20 < EMA50
+  - Volume > 1.8x moyenne
+
+================================================================================
+                          CONDITIONS SORTIE
+================================================================================
+
+1. Take Profit atteint (+4.0% ou -4.0%)
+2. Stop Loss touche (initial ou trailing)
+3. Signal Exit (ADX < 20 OU prix croise EMA20)
+4. Max Hold atteint (80 heures)
+
+================================================================================
+                              VALIDATION
+================================================================================
+
+Backtest                    18,114 bougies sur 8+ ans
+Frais Binance               0.1% inclus
+Volume Directionnel         Teste - Total est meilleur (-927% avec directionnel)
+Trailing SL                 Teste - Dynamique est meilleur (+725% vs fixe)
+
+================================================================================
+                            LANCEMENT
+================================================================================
+
+Commande: start_bot.bat
+OU: python bot_with_position_tracking.py
+
+Bot check toutes les 15 minutes
+Notifications Telegram en temps reel
+
+================================================================================
+                          DOCUMENTATION
+================================================================================
+
+STRATEGIE_FINALE.md         Documentation complete et detaillee
+STRATEGIE_ACTIVE.txt        Notes et configuration
+PERFORMANCES.txt            CE FICHIER (resume des perfs)
+
+final_strategy_rank8.py     Code de la strategie
+bot_with_position_tracking.py   Bot actif
+
+final_strategy_rank8_backtest.html   Rapport visuel avec graphiques
+
+================================================================================
+                              STATUS
+================================================================================
+
+STRATEGIE VALIDEE ET OPTIMISEE
+PRETE POUR PRODUCTION
+
+Derniere mise a jour: 24 Novembre 2025
+
+================================================================================
