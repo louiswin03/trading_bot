@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python final_strategy_rank8.py:*)"
+    ]
+  }
+}

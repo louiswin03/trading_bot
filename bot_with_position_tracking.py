@@ -292,6 +292,11 @@ Bot monitoring 24/7...
         current_candle = df.iloc[-1]
         position = self.tracker.position
 
+        # Save SL before trailing update - use old SL for exit check on this
+        # candle because we don't know if the favorable move happened before
+        # or after the adverse move within a single candle
+        sl_before_update = self.tracker.position['sl_price']
+
         # Update trailing SL based on current candle
         triggered_step = self.tracker.update_trailing_sl(
             current_candle['high'],
@@ -338,7 +343,7 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}
             position['direction'],
             position['candles_held'],
             best_price=position.get('best_price'),
-            current_sl=position.get('sl_price')
+            current_sl=sl_before_update
         )
 
         if should_exit:
