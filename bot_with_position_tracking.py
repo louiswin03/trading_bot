@@ -30,6 +30,7 @@ CHECK_INTERVAL_MINUTES = 15
 LIMIT = 200
 
 POSITION_FILE = 'current_position.json'
+BINANCE_FEE = 0.001  # 0.1% Binance fee per side
 
 class PositionTracker:
     """Track current open position"""
@@ -89,84 +90,84 @@ class PositionTracker:
         return self.position
 
     def update_trailing_sl(self, current_high, current_low):
-        """
-        Update trailing SL based on current price
-
-        Returns: triggered_step if SL was moved, None otherwise
-        """
+        """Update best_price + trailing SL. Returns list of crossed steps (may be empty)."""
         if not self.position:
-            return None
+            return []
 
         direction = self.position['direction']
         entry_price = self.position['entry_price']
         current_sl = self.position['sl_price']
 
-        # Update best price
         if direction == 'BUY':
             if current_high > self.position['best_price']:
                 self.position['best_price'] = current_high
-        else:  # SELL
+        else:
             if current_low < self.position['best_price']:
                 self.position['best_price'] = current_low
 
-        # Calculate new trailing SL
-        new_sl, triggered_step = calculate_trailing_sl(
-            entry_price,
-            self.position['best_price'],
-            direction,
-            current_sl
+        new_sl, triggered_steps = calculate_trailing_sl(
+            entry_price, self.position['best_price'], direction, current_sl
         )
 
-        # If SL was moved
-        if triggered_step and new_sl != current_sl:
+        if triggered_steps and new_sl != current_sl:
             self.position['sl_price'] = new_sl
-
-            # Update level description
-            if triggered_step[1] == 0:
+            last_sl_pct = triggered_steps[-1][1]
+            if last_sl_pct == 0:
                 self.position['current_sl_level'] = 'break_even'
             else:
-                self.position['current_sl_level'] = f"{triggered_step[1]}%"
-
+                self.position['current_sl_level'] = f"{last_sl_pct}%"
             self.save_position()
-            return triggered_step
 
-        return None
+        return triggered_steps
 
     def close_position(self, exit_price, exit_reason):
-        """Close current position"""
+        """Close current position. Includes Binance round-trip fees in PnL."""
         if not self.position:
             return None
 
         entry_price = self.position['entry_price']
         direction = self.position['direction']
 
-        # Calculate PnL
         if direction == 'BUY':
-            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-        else:  # SELL
-            pnl_pct = ((entry_price - exit_price) / entry_price) * 100
+            gross_pct = ((exit_price - entry_price) / entry_price) * 100
+        else:
+            gross_pct = ((entry_price - exit_price) / entry_price) * 100
+        fee_pct = BINANCE_FEE * 100 * 2
+        pnl_pct = gross_pct - fee_pct
 
-        pnl_usd = (exit_price - entry_price) if direction == 'BUY' else (entry_price - exit_price)
+        gross_per_unit = (exit_price - entry_price) if direction == 'BUY' else (entry_price - exit_price)
+        fees_per_unit = (entry_price + exit_price) * BINANCE_FEE
+        pnl_usd = gross_per_unit - fees_per_unit
+
+        try:
+            entry_dt = datetime.fromisoformat(self.position['entry_time'])
+            duration_hours = (datetime.now() - entry_dt).total_seconds() / 3600
+        except Exception:
+            duration_hours = self.position['candles_held'] * 4
 
         result = {
             'direction': direction,
             'entry_price': entry_price,
             'exit_price': exit_price,
             'pnl_pct': pnl_pct,
+            'gross_pct': gross_pct,
+            'fee_pct': fee_pct,
             'pnl_usd': pnl_usd,
             'exit_reason': exit_reason,
-            'candles_held': self.position['candles_held']
+            'candles_held': self.position['candles_held'],
+            'duration_hours': duration_hours,
         }
 
         print(f"\n{'='*100}")
-        print(f"🔔 POSITION CLOSED")
+        print(f"POSITION CLOSED")
         print(f"{'='*100}")
         print(f"Direction: {direction}")
         print(f"Entry: ${entry_price:,.2f}")
         print(f"Exit: ${exit_price:,.2f}")
-        print(f"PnL: {pnl_pct:+.2f}% (${pnl_usd:+,.2f})")
+        print(f"PnL: {pnl_pct:+.2f}% (gross {gross_pct:+.2f}%, fees -{fee_pct:.2f}%)")
+        print(f"USD/unit: ${pnl_usd:+,.2f}")
         print(f"Reason: {exit_reason}")
-        print(f"Duration: {self.position['candles_held']} candles")
+        print(f"Duration: {duration_hours:.1f}h ({self.position['candles_held']} closed candles)")
         print(f"{'='*100}\n")
 
         # Clear position
@@ -284,101 +285,59 @@ Bot monitoring 24/7...
         send_telegram_message(msg)
 
     def check_exit_signal(self, df):
-        """Check if current position should be exited"""
+        """Exit check FIRST with pre-candle SL. Trailing notifs sent only if no exit."""
         if not self.tracker.has_position():
             return
 
-        # Use CURRENT FORMING CANDLE (not closed) to detect exits in real-time
         current_candle = df.iloc[-1]
         position = self.tracker.position
+        sl_before_update = position['sl_price']
+        best_before_update = position['best_price']
 
-        # Save SL before trailing update - use old SL for exit check on this
-        # candle because we don't know if the favorable move happened before
-        # or after the adverse move within a single candle
-        sl_before_update = self.tracker.position['sl_price']
-
-        # Update trailing SL based on current candle
-        triggered_step = self.tracker.update_trailing_sl(
-            current_candle['high'],
-            current_candle['low']
-        )
-
-        # Send notification if a new step was triggered
-        if triggered_step:
-            gain_pct, new_sl_pct = triggered_step
-            entry_price = position['entry_price']
-            new_sl_price = self.tracker.position['sl_price']
-
-            if new_sl_pct == 0:
-                sl_desc = "Break Even"
-                emoji = "🔒"
-            else:
-                sl_desc = f"+{new_sl_pct}%"
-                emoji = "📈"
-
-            msg = f"""
-{emoji} TRAILING SL UPDATED
-
-Pair: {self.pair}
-Direction: {position['direction']}
-
-Trigger: +{gain_pct}% gain reached
-New SL: ${new_sl_price:,.2f} ({sl_desc})
-
-Entry: ${entry_price:,.2f}
-Best: ${self.tracker.position['best_price']:,.2f}
-TP: ${position['tp_price']:,.2f}
-
-Trade now protected at {sl_desc}!
-
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-            """
-            send_telegram_message(msg)
-            print(f"[TRAILING SL] Moved to {sl_desc} (${new_sl_price:,.2f})")
-
-        # Check exit conditions with trailing SL
+        # 1) Pessimistic exit check using SL valid BEFORE this candle.
         should_exit, reason, exit_price = check_exit_conditions(
             current_candle,
             position['entry_price'],
             position['direction'],
             position['candles_held'],
-            best_price=position.get('best_price'),
-            current_sl=sl_before_update
+            best_price=best_before_update,
+            current_sl=sl_before_update,
         )
 
+        # 2) Compute trailing steps crossed by this candle (also updates in-memory SL).
+        triggered_steps = self.tracker.update_trailing_sl(
+            current_candle['high'], current_candle['low']
+        )
+        best_after = self.tracker.position['best_price']
+
         if should_exit:
+            # Suppress trailing notifs that would contradict the exit.
+            wick_warning = ""
+            if triggered_steps and reason in ('SL', 'Trailing SL'):
+                top = triggered_steps[-1]
+                wick_warning = (
+                    f"\n[!] Favorable wick to ${best_after:,.2f} (+{top[0]}% gain) "
+                    f"in the same candle, but exit applied pessimistic prior SL."
+                )
+
             result = self.tracker.close_position(exit_price, reason)
-
             if result:
-                # Determine emoji based on PnL
-                if result['pnl_pct'] > 0:
-                    emoji = "✅"
-                    color = "GREEN"
-                else:
-                    emoji = "❌"
-                    color = "RED"
-
-                # Send exit notification
-                msg = f"""
-{emoji} EXIT SIGNAL - {color}
-
-Pair: {self.pair}
-Direction: {result['direction']}
-
-Entry: ${result['entry_price']:,.2f}
-Exit: ${result['exit_price']:,.2f}
-
-PnL: {result['pnl_pct']:+.2f}%
-USD: ${result['pnl_usd']:+,.2f}
-
-Reason: {reason}
-Duration: {result['candles_held']} candles
-
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-                """
+                emoji = "✅" if result['pnl_pct'] > 0 else "❌"
+                color = "GREEN" if result['pnl_pct'] > 0 else "RED"
+                msg = (
+                    f"\n{emoji} EXIT SIGNAL - {color}\n\n"
+                    f"Pair: {self.pair}\n"
+                    f"Direction: {result['direction']}\n\n"
+                    f"Entry: ${result['entry_price']:,.2f}\n"
+                    f"Exit: ${result['exit_price']:,.2f}\n\n"
+                    f"PnL: {result['pnl_pct']:+.2f}% (gross {result['gross_pct']:+.2f}%, fees -{result['fee_pct']:.2f}%)\n"
+                    f"USD/unit: ${result['pnl_usd']:+,.2f}\n\n"
+                    f"Reason: {reason}\n"
+                    f"Duration: {result['duration_hours']:.1f}h ({result['candles_held']} closed candles){wick_warning}\n\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                )
                 send_telegram_message(msg)
 
-                # Save to database
                 self.db.add_signal({
                     'pair': self.pair,
                     'signal': 'EXIT',
@@ -393,9 +352,40 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}
                     'factors': {
                         'exit_reason': reason,
                         'pnl_pct': result['pnl_pct'],
-                        'entry_price': result['entry_price']
+                        'gross_pct': result['gross_pct'],
+                        'fee_pct': result['fee_pct'],
+                        'entry_price': result['entry_price'],
+                        'duration_hours': result['duration_hours'],
                     }
                 })
+            return
+
+        # No exit: send a notif for EACH trailing step crossed (no skipping intermediate steps).
+        entry_price = position['entry_price']
+        direction = position['direction']
+        for step in triggered_steps:
+            gain_pct, new_sl_pct = step
+            if direction == 'BUY':
+                sl_price_at_step = entry_price * (1 + new_sl_pct / 100)
+            else:
+                sl_price_at_step = entry_price * (1 - new_sl_pct / 100)
+            sl_desc = "Break Even" if new_sl_pct == 0 else f"+{new_sl_pct}%"
+            emoji = "🔒" if new_sl_pct == 0 else "📈"
+            msg = (
+                f"\n{emoji} TRAILING SL UPDATED\n\n"
+                f"Pair: {self.pair}\n"
+                f"Direction: {direction}\n\n"
+                f"Trigger: +{gain_pct}% gain reached\n"
+                f"New SL: ${sl_price_at_step:,.2f} ({sl_desc})\n\n"
+                f"Entry: ${entry_price:,.2f}\n"
+                f"Best: ${best_after:,.2f}\n"
+                f"TP: ${position['tp_price']:,.2f}\n\n"
+                f"Trade now protected at {sl_desc}!\n\n"
+                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            )
+            send_telegram_message(msg)
+            print(f"[TRAILING SL] Moved to {sl_desc} (${sl_price_at_step:,.2f})")
+
 
     def check_entry_signal(self, df):
         """Check for new entry signal"""

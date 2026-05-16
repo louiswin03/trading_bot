@@ -157,35 +157,32 @@ def get_tp_sl_prices(entry_price, direction):
 
 def calculate_trailing_sl(entry_price, best_price, direction, current_sl):
     """
-    Calculate trailing SL based on best price reached
-
-    Returns: (new_sl_price, triggered_step) or (current_sl, None) if no change
+    Returns: (new_sl_price, triggered_steps)
+      triggered_steps = list of (gain_threshold, sl_pct) for EVERY step
+      crossed since current_sl, ascending. Empty list if none crossed.
     """
-    # Calculate current gain percentage
     if direction == 'BUY':
         gain_pct = ((best_price - entry_price) / entry_price) * 100
-    else:  # SELL
+    else:
         gain_pct = ((entry_price - best_price) / entry_price) * 100
 
-    # Check each step from highest to lowest
-    triggered_step = None
+    triggered_steps = []
     new_sl = current_sl
 
-    for gain_threshold, sl_pct in sorted(TRAILING_SL_STEPS, reverse=True):
+    for gain_threshold, sl_pct in sorted(TRAILING_SL_STEPS):
         if gain_pct >= gain_threshold:
             if direction == 'BUY':
                 potential_sl = entry_price * (1 + sl_pct / 100)
-                if potential_sl > current_sl:
+                if potential_sl > new_sl:
+                    triggered_steps.append((gain_threshold, sl_pct))
                     new_sl = potential_sl
-                    triggered_step = (gain_threshold, sl_pct)
-            else:  # SELL
+            else:
                 potential_sl = entry_price * (1 - sl_pct / 100)
-                if potential_sl < current_sl:
+                if potential_sl < new_sl:
+                    triggered_steps.append((gain_threshold, sl_pct))
                     new_sl = potential_sl
-                    triggered_step = (gain_threshold, sl_pct)
-            break
 
-    return new_sl, triggered_step
+    return new_sl, triggered_steps
 
 def get_current_sl_level(entry_price, best_price, direction):
     """
