@@ -1,10 +1,9 @@
 """
 FINAL OPTIMIZED STRATEGY - RANK 8 v2 + Trailing SL - CORRECTED VERSION
-Version avec correction du signal exit (prev_candle + exit au open)
-
-Changements par rapport à la version originale:
-- Signal exit utilise prev_candle (bougie fermée précédente) au lieu de current
-- Sortie au current['open'] au lieu de current['close']
+Full metrics edition: Sharpe, Sortino, Calmar, Recovery Factor,
+Volatility, Max DD Duration, Average DD, Worst Monthly Loss,
+Max Consecutive Losses, Expectancy, Best/Worst Trade, Time in Market,
+Turnover, Regime Sharpe, Alpha/Beta vs BTC, Fees included.
 """
 
 import sys
@@ -13,470 +12,489 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import pandas as pd
 import numpy as np
-from datetime import datetime
 from core.data_sources.market_data import get_ohlcv
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Strategy Parameters - RANK 8 v2
-PAIR = 'BTCUSDT'
-INTERVAL = '4h'
+PAIR = "BTCUSDT"
+INTERVAL = "4h"
 LIMIT = 20000
 BINANCE_FEE = 0.001
-INITIAL_CAPITAL = 10000
-
+SLIPPAGE_PCT = 0.0005  # 5 bps per side
+TOTAL_FRICTION = BINANCE_FEE + SLIPPAGE_PCT
+INITIAL_CAPITAL = 10_000
 ADX_THRESHOLD = 30
 TP_PCT = 4.0
 SL_PCT = 0.7
 MAX_HOLD = 20
 VOLUME_THRESHOLD = 1.8
+CANDLES_PER_YEAR = 365.25 * 6
+TRADING_DAYS_PER_YEAR = 365.25
+TRAILING_SL_STEPS = [(0.5,0.0),(1.0,0.5),(1.5,1.0),(2.0,1.5)]
+BULL_THRESHOLD = 0.20
+BEAR_THRESHOLD = -0.20
 
-# Trailing SL Steps: (gain_threshold_pct, new_sl_pct)
-TRAILING_SL_STEPS = [
-    (0.5, 0),    # At 0.5% gain -> SL to break even (0%)
-    (1.0, 0.5),  # At 1% gain -> SL to 0.5%
-    (1.5, 1.0),  # At 1.5% gain -> SL to 1%
-    (2.0, 1.5),  # At 2% gain -> SL to 1.5%
-]
+# ---------------------------------------------------------------------------
+# Indicators
+# ---------------------------------------------------------------------------
 
 def calculate_atr(df, period=14):
-    """Calculate ATR"""
-    high_low = df['high'] - df['low']
-    high_close = abs(df['high'] - df['close'].shift())
-    low_close = abs(df['low'] - df['close'].shift())
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return true_range.rolling(period).mean()
+    hl  = df["high"] - df["low"]
+    hc  = (df["high"] - df["close"].shift()).abs()
+    lc  = (df["low"]  - df["close"].shift()).abs()
+    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
 
 def calculate_adx(df, period=14):
-    """Calculate ADX"""
-    high_diff = df['high'].diff()
-    low_diff = -df['low'].diff()
-
-    plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
-    minus_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
-
+    hd  =  df["high"].diff()
+    ld  = -df["low"].diff()
+    pdm = hd.where((hd > ld) & (hd > 0), 0)
+    mdm = ld.where((ld > hd) & (ld > 0), 0)
     atr = calculate_atr(df, period)
-
-    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
-
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    pdi = 100 * (pdm.rolling(period).mean() / atr)
+    mdi = 100 * (mdm.rolling(period).mean() / atr)
+    dx  = 100 * (pdi - mdi).abs() / (pdi + mdi)
     adx = dx.rolling(period).mean()
-
-    df['adx'] = adx
-    df['plus_di'] = plus_di
-    df['minus_di'] = minus_di
-
+    df  = df.copy()
+    df["adx"], df["plus_di"], df["minus_di"] = adx, pdi, mdi
     return df
 
+
+# ---------------------------------------------------------------------------
+# Backtest engine
+# ---------------------------------------------------------------------------
+
 def backtest(df, initial_capital=INITIAL_CAPITAL):
-    """Run backtest with RANK 8 parameters - CORRECTED VERSION"""
+    df = calculate_adx(df).copy()
+    df["ema_20"]       = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_50"]       = df["close"].ewm(span=50, adjust=False).mean()
+    df["volume_ma"]    = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / df["volume_ma"]
 
-    df = calculate_adx(df)
-    df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['volume_ma'] = df['volume'].rolling(20).mean()
-    df['volume_ratio'] = df['volume'] / df['volume_ma']
-
-    trades = []
-    capital = initial_capital
-    in_trade = False
+    trades, equity_curve = [], []
+    capital      = initial_capital
+    in_trade     = False
     peak_capital = initial_capital
-    max_drawdown = 0
-    equity_curve = []
+    max_drawdown = 0.0
+    direction = entry_price = entry_i = entry_time = None
+    tp_price  = sl_price = best_price = quantity = None
 
     for i in range(55, len(df) - 1):
         current = df.iloc[i]
+        ts      = current["timestamp"]
 
-        # Track equity curve
-        equity_curve.append({
-            'timestamp': pd.Timestamp(current['timestamp'], unit='ms'),
-            'capital': capital,
-            'drawdown': ((peak_capital - capital) / peak_capital) * 100 if peak_capital > 0 else 0
-        })
-
+        dd_pct = (peak_capital - capital) / peak_capital * 100 if peak_capital > 0 else 0.0
+        equity_curve.append({"timestamp": ts, "capital": capital, "drawdown": dd_pct})
         if capital > peak_capital:
             peak_capital = capital
-        current_dd = ((peak_capital - capital) / peak_capital) * 100
-        if current_dd > max_drawdown:
-            max_drawdown = current_dd
+        cur_dd = (peak_capital - capital) / peak_capital * 100 if peak_capital > 0 else 0.0
+        if cur_dd > max_drawdown:
+            max_drawdown = cur_dd
 
         if not in_trade:
-            prev = df.iloc[i - 1]
-
-            bullish_trend = (prev.get('adx', 0) > ADX_THRESHOLD and
-                           prev.get('plus_di', 0) > prev.get('minus_di', 0) and
-                           prev['close'] > prev['ema_20'] and
-                           prev['ema_20'] > prev['ema_50'] and
-                           prev.get('volume_ratio', 1) > VOLUME_THRESHOLD)
-
-            bearish_trend = (prev.get('adx', 0) > ADX_THRESHOLD and
-                           prev.get('minus_di', 0) > prev.get('plus_di', 0) and
-                           prev['close'] < prev['ema_20'] and
-                           prev['ema_20'] < prev['ema_50'] and
-                           prev.get('volume_ratio', 1) > VOLUME_THRESHOLD)
-
-            if bullish_trend or bearish_trend:
-                in_trade = True
-                entry_price = prev['close']
-                entry_i = i
-                entry_time = pd.Timestamp(df.iloc[i - 1]['timestamp'], unit='ms')
-                direction = 'long' if bullish_trend else 'short'
-
-                quantity = (capital * 0.98) / entry_price
-                entry_fee = entry_price * quantity * BINANCE_FEE
-                capital -= entry_fee
-
-                if direction == 'long':
+            prev    = df.iloc[i - 1]
+            bullish = (
+                prev.get("adx", 0)          > ADX_THRESHOLD and
+                prev.get("plus_di", 0)      > prev.get("minus_di", 0) and
+                prev["close"]               > prev["ema_20"] and
+                prev["ema_20"]              > prev["ema_50"] and
+                prev.get("volume_ratio", 1) > VOLUME_THRESHOLD
+            )
+            bearish = (
+                prev.get("adx", 0)          > ADX_THRESHOLD and
+                prev.get("minus_di", 0)     > prev.get("plus_di", 0) and
+                prev["close"]               < prev["ema_20"] and
+                prev["ema_20"]              < prev["ema_50"] and
+                prev.get("volume_ratio", 1) > VOLUME_THRESHOLD
+            )
+            if bullish or bearish:
+                in_trade    = True
+                direction   = "long" if bullish else "short"
+                entry_price = prev["close"]
+                entry_i     = i
+                entry_time  = prev["timestamp"]
+                quantity    = (capital * 0.98) / entry_price
+                capital    -= entry_price * quantity * TOTAL_FRICTION
+                if direction == "long":
                     tp_price = entry_price * (1 + TP_PCT / 100)
                     sl_price = entry_price * (1 - SL_PCT / 100)
                 else:
                     tp_price = entry_price * (1 - TP_PCT / 100)
                     sl_price = entry_price * (1 + SL_PCT / 100)
-
-                # Initialize trailing SL tracking
                 best_price = entry_price
-
         else:
-            # CORRECTION: Utiliser prev_candle pour signal exit
-            prev_candle = df.iloc[i - 1]
-            current = df.iloc[i]
-            exit_price = None
-            exit_reason = None
+            prev_c     = df.iloc[i - 1]
+            exit_price = exit_reason = None
+            init_sl    = (entry_price * (1 - SL_PCT/100) if direction == "long"
+                          else entry_price * (1 + SL_PCT/100))
 
-            # Update best price for trailing SL
-            if direction == 'long':
-                if current['high'] > best_price:
-                    best_price = current['high']
-                current_gain_pct = ((best_price - entry_price) / entry_price) * 100
+            if direction == "long":
+                if current["high"] > best_price: best_price = current["high"]
+                gain_pct = (best_price - entry_price) / entry_price * 100
             else:
-                if current['low'] < best_price:
-                    best_price = current['low']
-                current_gain_pct = ((entry_price - best_price) / entry_price) * 100
+                if current["low"] < best_price: best_price = current["low"]
+                gain_pct = (entry_price - best_price) / entry_price * 100
 
-            # Apply trailing SL logic
-            for gain_threshold, new_sl in TRAILING_SL_STEPS:
-                if current_gain_pct >= gain_threshold:
-                    if direction == 'long':
-                        new_sl_price = entry_price * (1 + new_sl / 100)
-                        if new_sl_price > sl_price:
-                            sl_price = new_sl_price
+            for thr, nsl_pct in TRAILING_SL_STEPS:
+                if gain_pct >= thr:
+                    if direction == "long":
+                        p = entry_price * (1 + nsl_pct/100)
+                        if p > sl_price: sl_price = p
                     else:
-                        new_sl_price = entry_price * (1 - new_sl / 100)
-                        if new_sl_price < sl_price:
-                            sl_price = new_sl_price
+                        p = entry_price * (1 - nsl_pct/100)
+                        if p < sl_price: sl_price = p
 
-            # Check exit conditions
-            initial_sl = entry_price * (1 - SL_PCT / 100) if direction == 'long' else entry_price * (1 + SL_PCT / 100)
-
-            if direction == 'long':
-                if current['high'] >= tp_price:
-                    exit_price = tp_price
-                    exit_reason = 'TP'
-                elif current['low'] <= sl_price:
-                    exit_price = sl_price
-                    exit_reason = 'Trailing SL' if sl_price > initial_sl else 'SL'
-                # CORRECTION: Utiliser prev_candle et sortir au current['open']
-                elif prev_candle.get('adx', 0) < 20 or prev_candle['close'] < prev_candle['ema_20']:
-                    exit_price = current['open']
-                    exit_reason = 'Signal Exit'
+            if direction == "long":
+                if current["high"] >= tp_price:
+                    exit_price, exit_reason = tp_price, "TP"
+                elif current["low"] <= sl_price:
+                    exit_price  = sl_price
+                    exit_reason = "Trailing SL" if sl_price > init_sl else "SL"
+                elif prev_c.get("adx", 0) < 20 or prev_c["close"] < prev_c["ema_20"]:
+                    exit_price, exit_reason = current["open"], "Signal Exit"
             else:
-                if current['low'] <= tp_price:
-                    exit_price = tp_price
-                    exit_reason = 'TP'
-                elif current['high'] >= sl_price:
-                    exit_price = sl_price
-                    exit_reason = 'Trailing SL' if sl_price < initial_sl else 'SL'
-                # CORRECTION: Utiliser prev_candle et sortir au current['open']
-                elif prev_candle.get('adx', 0) < 20 or prev_candle['close'] > prev_candle['ema_20']:
-                    exit_price = current['open']
-                    exit_reason = 'Signal Exit'
+                if current["low"] <= tp_price:
+                    exit_price, exit_reason = tp_price, "TP"
+                elif current["high"] >= sl_price:
+                    exit_price  = sl_price
+                    exit_reason = "Trailing SL" if sl_price < init_sl else "SL"
+                elif prev_c.get("adx", 0) < 20 or prev_c["close"] > prev_c["ema_20"]:
+                    exit_price, exit_reason = current["open"], "Signal Exit"
 
             if exit_price is None and (i - entry_i) >= MAX_HOLD:
-                exit_price = current['close']
-                exit_reason = 'Max Hold'
+                exit_price, exit_reason = current["close"], "Max Hold"
 
-            if exit_price:
-                if direction == 'long':
-                    pnl_gross = (exit_price - entry_price) * quantity
-                else:
-                    pnl_gross = (entry_price - exit_price) * quantity
-
-                exit_fee = exit_price * quantity * BINANCE_FEE
-
-                pnl_net = pnl_gross - exit_fee
-
-                capital += pnl_net
-
-                trade_record = {
-                    'entry_time': entry_time,
-                    'exit_time': pd.Timestamp(df.iloc[i]['timestamp'], unit='ms'),
-                    'direction': direction,
-                    'entry_price': entry_price,
-                    'exit_price': exit_price,
-                    'pnl': pnl_net,
-                    'pnl_pct': (pnl_net / (entry_price * quantity)) * 100,
-                    'exit_reason': exit_reason,
-                }
-                trades.append(trade_record)
-
+            if exit_price is not None:
+                pg = ((exit_price - entry_price) if direction == "long"
+                      else (entry_price - exit_price)) * quantity
+                pn = pg - exit_price * quantity * TOTAL_FRICTION
+                capital += pn
+                trades.append({
+                    "entry_time":   entry_time,
+                    "exit_time":    current["timestamp"],
+                    "direction":    direction,
+                    "entry_price":  entry_price,
+                    "exit_price":   exit_price,
+                    "quantity":     quantity,
+                    "pnl":          pn,
+                    "pnl_pct":      pn / (entry_price * quantity) * 100,
+                    "exit_reason":  exit_reason,
+                    "hold_candles": i - entry_i,
+                })
                 in_trade = False
 
     return trades, capital, max_drawdown, pd.DataFrame(equity_curve)
 
-def generate_html_report(df, trades, capital, max_dd, equity_df):
-    """Generate comprehensive HTML report"""
 
-    # Calculate statistics
-    wins = [t for t in trades if t['pnl'] > 0]
-    losses = [t for t in trades if t['pnl'] <= 0]
+# ===========================================================================
+# Metrics, Buy & Hold baseline, HTML report, runner
+# Added: Sharpe/Sortino/Calmar/Recovery; Vol/MaxDD-Duration/AvgDD/WorstMonth/MaxConsecLosses;
+#        Expectancy/Best-Worst/TimeInMarket/Turnover; Regime Sharpe; Alpha/Beta vs B&H BTC.
+# ===========================================================================
+import math
 
-    total_pnl = sum(t['pnl'] for t in trades)
-    total_return = ((capital - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
+def compute_buy_hold(df, initial_capital=INITIAL_CAPITAL):
+    """Returns DataFrame with timestamp, capital (B&H BTC starting at initial_capital)."""
+    sub = df.iloc[55:].reset_index(drop=True).copy()
+    base = sub["close"].iloc[0]
+    sub["capital"] = (sub["close"] / base) * initial_capital
+    return sub[["timestamp", "capital"]]
 
-    years_span = (pd.to_datetime(df['timestamp'], unit='ms').max() -
-                 pd.to_datetime(df['timestamp'], unit='ms').min()).days / 365.25
-    annual_return = (((capital / INITIAL_CAPITAL) ** (1 / years_span)) - 1) * 100
 
-    winrate = len(wins) / len(trades) * 100 if trades else 0
-    avg_win = np.mean([t['pnl'] for t in wins]) if wins else 0
-    avg_loss = np.mean([t['pnl'] for t in losses]) if losses else 0
+def classify_regime(df, lookback_candles=540):
+    """Classify each candle as bull/bear/sideways from rolling BTC return."""
+    roll_ret = df["close"].pct_change(lookback_candles)
+    regimes = pd.Series("sideways", index=df.index, dtype=object)
+    regimes[roll_ret > BULL_THRESHOLD] = "bull"
+    regimes[roll_ret < BEAR_THRESHOLD] = "bear"
+    return regimes
 
-    # Create subplots
+
+def _annualized_sharpe(returns, periods_per_year):
+    r = pd.Series(returns).dropna()
+    if len(r) < 2:
+        return 0.0
+    s = r.std(ddof=1)
+    return float((r.mean() / s) * math.sqrt(periods_per_year)) if s > 0 else 0.0
+
+
+def compute_metrics(trades, capital, max_drawdown, equity_df, df,
+                    initial_capital=INITIAL_CAPITAL):
+    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
+        columns=["pnl", "pnl_pct", "hold_candles", "entry_time", "exit_time"]
+    )
+    eq = equity_df["capital"].astype(float).reset_index(drop=True)
+    ts = pd.to_datetime(equity_df["timestamp"]).reset_index(drop=True)
+    ret = eq.pct_change().dropna()
+
+    ann = CANDLES_PER_YEAR
+    years = len(ret) / ann if ann else 0
+    total_return = capital / initial_capital - 1
+    cagr = (capital / initial_capital) ** (1 / years) - 1 if years > 0 else 0.0
+
+    # --- Risk-adjusted ---
+    sharpe = _annualized_sharpe(ret, ann)
+    downside = ret[ret < 0]
+    dstd = downside.std(ddof=1) if len(downside) > 1 else 0.0
+    sortino = float((ret.mean() / dstd) * math.sqrt(ann)) if dstd > 0 else 0.0
+    calmar = (cagr / (max_drawdown / 100)) if max_drawdown > 0 else 0.0
+    peak = eq.cummax()
+    dd_abs = float((peak - eq).max()) if len(eq) else 0.0
+    net_profit = capital - initial_capital
+    recovery_factor = net_profit / dd_abs if dd_abs > 0 else 0.0
+
+    # --- Risk ---
+    vol_ann = float(ret.std(ddof=1) * math.sqrt(ann)) if len(ret) > 1 else 0.0
+
+    is_dd = eq < peak
+    dd_periods, cur = [], None
+    for i, v in enumerate(is_dd):
+        if v and cur is None:
+            cur = i
+        elif (not v) and cur is not None:
+            dd_periods.append(i - cur)
+            cur = None
+    if cur is not None:
+        dd_periods.append(len(is_dd) - cur)
+    max_dd_dur_candles = max(dd_periods) if dd_periods else 0
+    max_dd_dur_days = max_dd_dur_candles / 6.0
+
+    dd_pcts = ((peak - eq) / peak * 100).replace([float("inf"), -float("inf")], 0).fillna(0)
+    pos_dd = dd_pcts[dd_pcts > 0]
+    avg_dd = float(pos_dd.mean()) if len(pos_dd) else 0.0
+
+    eq_ts = pd.DataFrame({"capital": eq.values}, index=pd.to_datetime(ts.values))
+    monthly_last = eq_ts["capital"].resample("ME").last().dropna()
+    monthly_ret = monthly_last.pct_change().dropna()
+    worst_monthly = float(monthly_ret.min() * 100) if len(monthly_ret) else 0.0
+
+    max_consec_losses, cur_streak = 0, 0
+    if "pnl" in trades_df:
+        for p in trades_df["pnl"]:
+            if p < 0:
+                cur_streak += 1
+                max_consec_losses = max(max_consec_losses, cur_streak)
+            else:
+                cur_streak = 0
+
+    # --- Trade stats ---
+    n_trades = len(trades_df)
+    wins = trades_df[trades_df["pnl"] > 0] if n_trades else trades_df
+    losses = trades_df[trades_df["pnl"] <= 0] if n_trades else trades_df
+    win_rate = len(wins) / n_trades if n_trades else 0.0
+    avg_win = float(wins["pnl_pct"].mean()) if len(wins) else 0.0
+    avg_loss = float(losses["pnl_pct"].mean()) if len(losses) else 0.0
+    expectancy = win_rate * avg_win + (1 - win_rate) * avg_loss
+    best_trade = float(trades_df["pnl_pct"].max()) if n_trades else 0.0
+    worst_trade = float(trades_df["pnl_pct"].min()) if n_trades else 0.0
+    total_hold = float(trades_df["hold_candles"].sum()) if n_trades else 0.0
+    time_in_market = (total_hold / max(len(df) - 55, 1)) * 100
+    turnover = n_trades / years if years > 0 else 0.0
+
+    # --- Robustesse ---
+    regimes = classify_regime(df).iloc[55:].reset_index(drop=True)
+    # Align: equity_df rows correspond to i in range(55, len(df)-1) -> regimes index 0..len-2-55
+    n_align = min(len(regimes), len(eq))
+    reg_aligned = regimes.iloc[:n_align].reset_index(drop=True)
+    ret_aligned = pd.Series(eq.values[:n_align]).pct_change()
+    by_regime = {}
+    for label in ["bull", "bear", "sideways"]:
+        mask = (reg_aligned == label).values
+        r_sub = ret_aligned[mask].dropna()
+        by_regime[label] = {
+            "sharpe": _annualized_sharpe(r_sub, ann),
+            "n_periods": int(mask.sum()),
+            "pct_of_time": float(mask.mean() * 100),
+        }
+
+    # Alpha/Beta vs Buy & Hold BTC
+    bh = compute_buy_hold(df, initial_capital)
+    bh_ret = bh["capital"].pct_change().dropna().reset_index(drop=True)
+    strat_ret = pd.Series(eq.values).pct_change().dropna().reset_index(drop=True)
+    n = min(len(bh_ret), len(strat_ret))
+    if n > 2:
+        x, y = bh_ret.iloc[:n].values, strat_ret.iloc[:n].values
+        var_x = x.var(ddof=1)
+        beta = float(((x - x.mean()) * (y - y.mean())).sum() / (var_x * (n - 1))) if var_x > 0 else 0.0
+        alpha_periodic = float(y.mean() - beta * x.mean())
+        alpha_ann = alpha_periodic * ann
+    else:
+        beta, alpha_ann = 0.0, 0.0
+
+    bh_final = float(bh["capital"].iloc[-1]) if len(bh) else initial_capital
+    bh_return_pct = (bh_final / initial_capital - 1) * 100
+
+    return {
+        "years": years,
+        "total_return_pct": total_return * 100,
+        "cagr_pct": cagr * 100,
+        "final_capital": capital,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+        "recovery_factor": recovery_factor,
+        "volatility_ann_pct": vol_ann * 100,
+        "max_drawdown_pct": max_drawdown,
+        "max_dd_duration_days": max_dd_dur_days,
+        "max_dd_duration_candles": max_dd_dur_candles,
+        "avg_drawdown_pct": avg_dd,
+        "worst_monthly_loss_pct": worst_monthly,
+        "max_consecutive_losses": max_consec_losses,
+        "total_trades": n_trades,
+        "win_rate_pct": win_rate * 100,
+        "expectancy_pct": expectancy,
+        "best_trade_pct": best_trade,
+        "worst_trade_pct": worst_trade,
+        "avg_win_pct": avg_win,
+        "avg_loss_pct": avg_loss,
+        "time_in_market_pct": time_in_market,
+        "turnover_per_year": turnover,
+        "regime_sharpe": by_regime,
+        "alpha_annualized_pct": alpha_ann * 100,
+        "beta": beta,
+        "buy_hold_return_pct": bh_return_pct,
+        "fees_pct_per_side": BINANCE_FEE * 100,
+        "slippage_pct_per_side": SLIPPAGE_PCT * 100,
+    }
+
+
+def _fmt(x, dp=2, suffix=""):
+    try:
+        return f"{x:,.{dp}f}{suffix}"
+    except Exception:
+        return str(x)
+
+
+def generate_html(metrics, equity_df, trades, df, output_path):
+    bh = compute_buy_hold(df)
+    eq_ts = pd.to_datetime(equity_df["timestamp"])
+    peak = equity_df["capital"].astype(float).cummax()
+    dd = (peak - equity_df["capital"]) / peak * 100
+
     fig = make_subplots(
-        rows=4, cols=1,
-        subplot_titles=('Equity Curve', 'Drawdown', 'Price with Trades', 'Trade Distribution'),
-        vertical_spacing=0.08,
-        row_heights=[0.3, 0.2, 0.3, 0.2]
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        row_heights=[0.7, 0.3],
+        subplot_titles=("Equity Curve (Strategy vs Buy & Hold BTC)", "Drawdown (%)"),
     )
+    fig.add_trace(go.Scatter(x=eq_ts, y=equity_df["capital"], name="Strategy",
+                             line=dict(color="#16a34a", width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pd.to_datetime(bh["timestamp"]), y=bh["capital"],
+                             name="Buy & Hold BTC",
+                             line=dict(color="#9ca3af", width=1, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=eq_ts, y=-dd, name="Drawdown",
+                             fill="tozeroy", line=dict(color="#dc2626", width=1)),
+                  row=2, col=1)
+    fig.update_layout(height=700, template="plotly_white",
+                      title="Final Strategy RANK 8 - Backtest Report",
+                      legend=dict(orientation="h", y=1.05))
+    chart_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
 
-    # 1. Equity Curve
-    fig.add_trace(
-        go.Scatter(x=equity_df['timestamp'], y=equity_df['capital'],
-                  name='Capital', line=dict(color='blue', width=2)),
-        row=1, col=1
-    )
+    m = metrics
+    rg = m["regime_sharpe"]
 
-    # 2. Drawdown
-    fig.add_trace(
-        go.Scatter(x=equity_df['timestamp'], y=-equity_df['drawdown'],
-                  name='Drawdown', fill='tozeroy',
-                  line=dict(color='red', width=1)),
-        row=2, col=1
-    )
+    def row(label, value, hint=""):
+        return f'<tr><td>{label}</td><td class="v">{value}</td><td class="hint">{hint}</td></tr>'
 
-    # 3. Price with trades
-    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
-    fig.add_trace(
-        go.Candlestick(x=df['date'], open=df['open'], high=df['high'],
-                      low=df['low'], close=df['close'], name='Price'),
-        row=3, col=1
-    )
+    sections = f"""
+    <h2>Risk-adjusted returns</h2>
+    <table>
+      {row("Sharpe Ratio (annualised)", _fmt(m["sharpe"], 2))}
+      {row("Sortino Ratio (annualised)", _fmt(m["sortino"], 2))}
+      {row("Calmar Ratio", _fmt(m["calmar"], 2), "CAGR / MaxDD")}
+      {row("Recovery Factor", _fmt(m["recovery_factor"], 2), "Net profit / Max DD ($)")}
+    </table>
 
-    # Add trade markers
-    for trade in trades:
-        color = 'green' if trade['pnl'] > 0 else 'red'
-        fig.add_trace(
-            go.Scatter(x=[trade['entry_time']], y=[trade['entry_price']],
-                      mode='markers', marker=dict(color=color, size=8, symbol='triangle-up'),
-                      showlegend=False),
-            row=3, col=1
-        )
-        fig.add_trace(
-            go.Scatter(x=[trade['exit_time']], y=[trade['exit_price']],
-                      mode='markers', marker=dict(color=color, size=8, symbol='triangle-down'),
-                      showlegend=False),
-            row=3, col=1
-        )
+    <h2>Risk</h2>
+    <table>
+      {row("Volatility (annualised)", _fmt(m["volatility_ann_pct"], 2, "%"))}
+      {row("Max Drawdown", _fmt(m["max_drawdown_pct"], 2, "%"))}
+      {row("Max DD Duration", f'{_fmt(m["max_dd_duration_days"], 1)} days ({m["max_dd_duration_candles"]} candles)')}
+      {row("Average Drawdown", _fmt(m["avg_drawdown_pct"], 2, "%"))}
+      {row("Worst Monthly Loss", _fmt(m["worst_monthly_loss_pct"], 2, "%"))}
+      {row("Max Consecutive Losses", m["max_consecutive_losses"])}
+    </table>
 
-    # 4. Trade distribution
-    pnl_values = [t['pnl'] for t in trades]
-    fig.add_trace(
-        go.Histogram(x=pnl_values, name='Trade PnL',
-                    marker=dict(color='blue'), nbinsx=30),
-        row=4, col=1
-    )
+    <h2>Trade statistics</h2>
+    <table>
+      {row("Total Trades", m["total_trades"])}
+      {row("Win Rate", _fmt(m["win_rate_pct"], 1, "%"))}
+      {row("Expectancy / Trade", _fmt(m["expectancy_pct"], 3, "%"))}
+      {row("Best Trade", _fmt(m["best_trade_pct"], 2, "%"))}
+      {row("Worst Trade", _fmt(m["worst_trade_pct"], 2, "%"))}
+      {row("Avg Win / Avg Loss", f'{_fmt(m["avg_win_pct"], 2, "%")} / {_fmt(m["avg_loss_pct"], 2, "%")}')}
+      {row("Time in Market", _fmt(m["time_in_market_pct"], 1, "%"))}
+      {row("Turnover", _fmt(m["turnover_per_year"], 1, " trades/year"))}
+    </table>
 
-    fig.update_layout(height=1400, showlegend=True, title_text="RANK 8 v2 + Trailing SL - CORRECTED VERSION - Backtest Report")
-    fig.update_xaxes(title_text="Date", row=4, col=1)
-    fig.update_yaxes(title_text="Capital ($)", row=1, col=1)
-    fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
-    fig.update_yaxes(title_text="Price ($)", row=3, col=1)
-    fig.update_yaxes(title_text="Frequency", row=4, col=1)
+    <h2>Robustness</h2>
+    <table>
+      {row("Sharpe (Bull regime)", f'{_fmt(rg["bull"]["sharpe"], 2)}', f'{_fmt(rg["bull"]["pct_of_time"], 1, "%")} of time')}
+      {row("Sharpe (Bear regime)", f'{_fmt(rg["bear"]["sharpe"], 2)}', f'{_fmt(rg["bear"]["pct_of_time"], 1, "%")} of time')}
+      {row("Sharpe (Sideways)", f'{_fmt(rg["sideways"]["sharpe"], 2)}', f'{_fmt(rg["sideways"]["pct_of_time"], 1, "%")} of time')}
+      {row("Alpha vs B&amp;H BTC (annualised)", _fmt(m["alpha_annualized_pct"], 2, "%"))}
+      {row("Beta vs B&amp;H BTC", _fmt(m["beta"], 3))}
+      {row("Buy &amp; Hold BTC return (period)", _fmt(m["buy_hold_return_pct"], 2, "%"))}
+      {row("Fees included", f'{_fmt(m["fees_pct_per_side"], 2, "%")} per side (Binance)')}
+      {row("Slippage included", f'{_fmt(m["slippage_pct_per_side"], 2, "%")} per side')}
+    </table>
 
-    # Generate HTML
-    html_content = f"""
-    <html>
-    <head>
-        <title>Strategy RANK 8 - CORRECTED - Backtest Report</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-            .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; }}
-            h1 {{ color: #2c3e50; text-align: center; }}
-            .stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin: 30px 0; }}
-            .stat-box {{ background: #ecf0f1; padding: 20px; border-radius: 8px; text-align: center; }}
-            .stat-box h3 {{ margin: 0 0 10px 0; color: #34495e; font-size: 14px; }}
-            .stat-box .value {{ font-size: 28px; font-weight: bold; color: #2c3e50; }}
-            .positive {{ color: #27ae60; }}
-            .negative {{ color: #e74c3c; }}
-            .parameters {{ background: #e67e22; color: white; padding: 20px; border-radius: 8px; margin: 20px 0; }}
-            .parameters h2 {{ margin-top: 0; }}
-            table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-            th {{ background: #34495e; color: white; }}
-            tr:hover {{ background: #f5f5f5; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🏆 RANK 8 - CORRECTED VERSION - Backtest Results</h1>
-
-            <div class="parameters">
-                <h2>Strategy Parameters (CORRECTED VERSION)</h2>
-                <p><strong>Pair:</strong> {PAIR} | <strong>Timeframe:</strong> {INTERVAL}</p>
-                <p><strong>ADX Threshold:</strong> {ADX_THRESHOLD} | <strong>TP:</strong> {TP_PCT}% | <strong>Initial SL:</strong> {SL_PCT}%</p>
-                <p><strong>Trailing SL:</strong> +0.5%→BE, +1%→+0.5%, +1.5%→+1%, +2%→+1.5%</p>
-                <p><strong>Max Hold:</strong> {MAX_HOLD} candles | <strong>Volume:</strong> {VOLUME_THRESHOLD}x</p>
-                <p><strong>Period:</strong> {pd.to_datetime(df['timestamp'].min(), unit='ms').strftime('%Y-%m-%d')} to {pd.to_datetime(df['timestamp'].max(), unit='ms').strftime('%Y-%m-%d')}</p>
-                <p style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.3); padding-top: 15px;">
-                    <strong>⚠️ CORRECTIONS APPLIQUÉES:</strong><br>
-                    • Signal exit utilise prev_candle (bougie précédente) au lieu de current<br>
-                    • Sortie au current['open'] au lieu de current['close']
-                </p>
-            </div>
-
-            <div class="stats">
-                <div class="stat-box">
-                    <h3>Initial Capital</h3>
-                    <div class="value">${INITIAL_CAPITAL:,.0f}</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Final Capital</h3>
-                    <div class="value positive">${capital:,.2f}</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Total Return</h3>
-                    <div class="value positive">{total_return:.2f}%</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Annual Return</h3>
-                    <div class="value positive">{annual_return:.2f}%</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Max Drawdown</h3>
-                    <div class="value negative">{max_dd:.2f}%</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Total Trades</h3>
-                    <div class="value">{len(trades)}</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Win Rate</h3>
-                    <div class="value {'positive' if winrate > 50 else 'negative'}">{winrate:.1f}%</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Winning Trades</h3>
-                    <div class="value positive">{len(wins)}</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Losing Trades</h3>
-                    <div class="value negative">{len(losses)}</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Avg Win</h3>
-                    <div class="value positive">${avg_win:.2f}</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Avg Loss</h3>
-                    <div class="value negative">${avg_loss:.2f}</div>
-                </div>
-                <div class="stat-box">
-                    <h3>Profit Factor</h3>
-                    <div class="value">{abs(sum(t['pnl'] for t in wins) / sum(t['pnl'] for t in losses)) if losses and sum(t['pnl'] for t in losses) != 0 else 0:.2f}</div>
-                </div>
-            </div>
-
-            {fig.to_html(full_html=False, include_plotlyjs='cdn')}
-
-            <h2>Last 20 Trades</h2>
-            <table>
-                <tr>
-                    <th>Entry Time</th>
-                    <th>Exit Time</th>
-                    <th>Direction</th>
-                    <th>Entry Price</th>
-                    <th>Exit Price</th>
-                    <th>PnL</th>
-                    <th>PnL %</th>
-                    <th>Exit Reason</th>
-                </tr>
+    <h2>Summary</h2>
+    <table>
+      {row("Period", _fmt(m["years"], 2, " years"))}
+      {row("Total Return", _fmt(m["total_return_pct"], 2, "%"))}
+      {row("CAGR", _fmt(m["cagr_pct"], 2, "%"))}
+      {row("Final Capital", f'${_fmt(m["final_capital"], 0)}')}
+    </table>
     """
 
-    for trade in trades[-20:]:
-        pnl_class = 'positive' if trade['pnl'] > 0 else 'negative'
-        html_content += f"""
-                <tr>
-                    <td>{trade['entry_time'].strftime('%Y-%m-%d %H:%M')}</td>
-                    <td>{trade['exit_time'].strftime('%Y-%m-%d %H:%M')}</td>
-                    <td>{trade['direction'].upper()}</td>
-                    <td>${trade['entry_price']:,.2f}</td>
-                    <td>${trade['exit_price']:,.2f}</td>
-                    <td class="{pnl_class}">${trade['pnl']:,.2f}</td>
-                    <td class="{pnl_class}">{trade['pnl_pct']:.2f}%</td>
-                    <td>{trade['exit_reason']}</td>
-                </tr>
-        """
+    html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>RANK 8 Backtest Report</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+          max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #111; }}
+  h1 {{ border-bottom: 2px solid #16a34a; padding-bottom: 8px; }}
+  h2 {{ color: #16a34a; margin-top: 28px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 8px; }}
+  td {{ padding: 8px 10px; border-bottom: 1px solid #e5e7eb; }}
+  td.v {{ text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }}
+  td.hint {{ color: #6b7280; font-size: 12px; width: 220px; }}
+  .footer {{ color: #6b7280; font-size: 12px; margin-top: 24px; }}
+</style></head><body>
+<h1>RANK 8 - Backtest Report</h1>
+<p class="footer">Pair: {PAIR} - Interval: {INTERVAL} - Fees: {BINANCE_FEE*100:.2f}%/side - Slippage: {SLIPPAGE_PCT*100:.2f}%/side - Generated {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}</p>
+{chart_html}
+{sections}
+<p class="footer">Slippage and Binance fees are applied on entry AND exit in the backtest engine (TOTAL_FRICTION = BINANCE_FEE + SLIPPAGE_PCT).</p>
+</body></html>"""
+    Path(output_path).write_text(html, encoding="utf-8")
+    return output_path
 
-    html_content += """
-            </table>
-        </div>
-    </body>
-    </html>
-    """
-
-    return html_content
 
 def main():
-    print("\n" + "="*100)
-    print("RANK 8 v2 + TRAILING SL - CORRECTED VERSION - BACKTEST")
-    print("="*100)
-    print(f"\nParameters: ADX {ADX_THRESHOLD}, TP {TP_PCT}%, Initial SL {SL_PCT}%, Volume {VOLUME_THRESHOLD}x")
-    print("Trailing SL: +0.5%->BE, +1%->+0.5%, +1.5%->+1%, +2%->+1.5%")
-    print("\n[!] CORRECTIONS APPLIQUEES:")
-    print("  - Signal exit utilise prev_candle au lieu de current")
-    print("  - Sortie au current['open'] au lieu de current['close']")
-    print("\nFetching data...")
-
+    print(f"Fetching {PAIR} {INTERVAL} data (limit={LIMIT})...")
     df = get_ohlcv(PAIR, interval=INTERVAL, limit_total=LIMIT)
-
-    if df is None:
-        print("Error fetching data")
-        return
-
-    print(f"Data fetched: {len(df)} candles")
-    print("Running backtest...")
-
+    if df is None or len(df) < 100:
+        raise SystemExit("No data fetched")
+    print(f"Got {len(df)} candles from {df.iloc[0]['timestamp']} to {df.iloc[-1]['timestamp']}")
     trades, capital, max_dd, equity_df = backtest(df)
+    print(f"Backtest done: {len(trades)} trades, final ${capital:,.2f}, max DD {max_dd:.2f}%")
+    metrics = compute_metrics(trades, capital, max_dd, equity_df, df)
+    out = generate_html(metrics, equity_df, trades, df,
+                        "final_strategy_rank8_corrected_backtest.html")
+    print(f"HTML written: {out}")
+    print("\n--- Headline metrics ---")
+    for k in ("years", "total_return_pct", "cagr_pct", "sharpe", "sortino",
+              "calmar", "recovery_factor", "max_drawdown_pct",
+              "max_dd_duration_days", "worst_monthly_loss_pct",
+              "expectancy_pct", "time_in_market_pct", "turnover_per_year",
+              "alpha_annualized_pct", "beta", "buy_hold_return_pct"):
+        print(f"  {k}: {metrics[k]:.4f}" if isinstance(metrics[k], float) else f"  {k}: {metrics[k]}")
+    print("\n--- Regime Sharpe ---")
+    for label, info in metrics["regime_sharpe"].items():
+        print(f"  {label:10s} sharpe={info['sharpe']:.2f}  pct_time={info['pct_of_time']:.1f}%  n={info['n_periods']}")
 
-    print("\n" + "="*100)
-    print("RESULTS - CORRECTED VERSION")
-    print("="*100)
-    print(f"Initial Capital:  ${INITIAL_CAPITAL:,.2f}")
-    print(f"Final Capital:    ${capital:,.2f}")
-    print(f"Total Return:     {((capital - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100:.2f}%")
-    print(f"Max Drawdown:     {max_dd:.2f}%")
-    print(f"Total Trades:     {len(trades)}")
-    print(f"Win Rate:         {len([t for t in trades if t['pnl'] > 0]) / len(trades) * 100:.1f}%")
-
-    print("\nGenerating HTML report...")
-    html_content = generate_html_report(df, trades, capital, max_dd, equity_df)
-
-    output_file = "final_strategy_rank8_corrected_backtest.html"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-
-    print(f"Report saved to: {output_file}")
-    print("="*100 + "\n")
 
 if __name__ == "__main__":
     main()
